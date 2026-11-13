@@ -10,6 +10,7 @@ import cv2
 import logging
 import argparse
 import os
+import time
 
 # Import weapon detection components
 from weapon_detection.config import build_default_config
@@ -22,7 +23,7 @@ from weapon_detection.vlm import(
 )
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/api/*": {"origins": "*"}, r"/video_feed": {"origins": "*"}})
 
 # Setup logging
 logging.basicConfig(level=logging.DEBUG)
@@ -37,9 +38,9 @@ current_frame = None
 frame_lock = threading.Lock()
 current_detections = []
 detection_lock = threading.Lock()
-unique_track_ids = set()  # Track unique detections
+unique_track_ids = set()
 track_lock = threading.Lock()
-session_alert_count = 0  # Count alerts in current session
+session_alert_count = 0
 alert_count_lock = threading.Lock()
 
 # Global configuration state
@@ -81,16 +82,13 @@ def run_detection_with_runner(source):
         current_source = str(source)
         frame_count = 0
         
-        # Reset unique track IDs for new detection session
         with track_lock:
             unique_track_ids.clear()
         
-        # Reset alert count for new session
         with alert_count_lock:
             global session_alert_count
             session_alert_count = 0
         
-        # Build config with the provided source and current config
         with config_lock:
             cfg_copy = current_config.copy()
         
@@ -110,10 +108,8 @@ def run_detection_with_runner(source):
         )
         config = build_default_config(args)
         
-        # Create runner
         runner = WeaponDetectionRunner(config)
 
-        # Prepare VLM model once per session if enabled in UI config.
         vlm_model = None
         vlm_processor = None
         if config.vlm.use_vlm:
@@ -126,7 +122,6 @@ def run_detection_with_runner(source):
             else:
                 logger.warning(f"Unknown VLM model configured: {config.vlm.vlm_model}")
         
-        # Open video capture
         cap = cv2.VideoCapture(config.inference.source)
         if not cap.isOpened():
             logger.error(f"Failed to open source: {source}")
@@ -148,7 +143,6 @@ def run_detection_with_runner(source):
                 frame_num += 1
                 frame_count = frame_num
                 
-                # Run tracking (original logic)
                 results = runner.model.track(
                     frame,
                     conf=config.inference.conf,
@@ -157,7 +151,6 @@ def run_detection_with_runner(source):
                     verbose=False,
                 )
                 
-                # Process results
                 with detection_lock:
                     current_detections = []
                     
@@ -172,14 +165,11 @@ def run_detection_with_runner(source):
                             conf = float(box.conf[0])
                             class_name = result.names[cls_id]
                             
-                            # Track unique detections
                             with track_lock:
                                 unique_track_ids.add(track_id)
                             
-                            # Draw box on frame
                             runner._draw_box(frame, box, track_id, conf)
                             
-                            # Store detection info
                             current_detections.append({
                                 "class": class_name,
                                 "confidence": conf,
@@ -187,21 +177,17 @@ def run_detection_with_runner(source):
                                 "bbox": box.xyxy[0].tolist()
                             })
                             
-                            # Handle alerting logic
                             runner.tracks.update_seen(track_id, frame_num)
                             if cls_id in alert_classes:
                                 runner.tracks.increment_persistence(track_id)
                                 
                                 if runner.tracks.can_alert(track_id):
                                     logger.warning(f"Weapon detected | track_id={track_id}")
-                                    # Save snapshot
                                     snapshot = runner._snapshot_path(track_id)
                                     cv2.imwrite(str(snapshot), frame)
                                     
-                                    # Increment session alert count
                                     with alert_count_lock:
                                         session_alert_count += 1
-                                    
 
                                     vlm_description = None
                                     if config.vlm.use_vlm and vlm_model is not None:
@@ -212,11 +198,9 @@ def run_detection_with_runner(source):
                                                 vlm_description = query_model_pali(frame, vlm_model, vlm_processor)
                                             elif config.vlm.vlm_model == "qwen":
                                                 vlm_description = query_model_qwen(frame, vlm_model, vlm_processor)
-                                            
                                         except Exception as exc:
                                             logger.exception("VLM query failed for track_id=%s: %s", track_id, exc)
                                     
-                                    # Dispatch alert
                                     event = AlertEvent(
                                         frame_number=frame_num,
                                         track_id=track_id,
@@ -235,10 +219,8 @@ def run_detection_with_runner(source):
                                         "description": vlm_description if config.vlm.use_vlm else None,
                                     })
                 
-                # Cleanup old tracks
                 runner.tracks.cleanup(frame_num)
                 
-                # Store frame for streaming
                 with frame_lock:
                     current_frame = frame.copy()
                 
@@ -262,7 +244,11 @@ def run_detection_with_runner(source):
 @app.route("/")
 def index():
     """Serve the dashboard."""
-    return render_template("index.html")
+    try:
+        return render_template("index.html")
+    except Exception as e:
+        logger.error(f"Error rendering index: {e}")
+        return f"Error: {e}", 500
 
 
 @app.route("/alerts")
@@ -297,35 +283,38 @@ def video_feed():
         while is_running:
             with frame_lock:
                 if current_frame is not None:
-                    # Encode frame as JPEG
-                    ret, buffer = cv2.imencode('.jpg', current_frame)
-                    frame_bytes = buffer.tobytes()
-                    
-                    # Yield frame in MJPEG format
-                    yield (b'--frame\r\n'
-                           b'Content-Type: image/jpeg\r\n'
-                           b'Content-Length: ' + str(len(frame_bytes)).encode() + b'\r\n\r\n'
-                           + frame_bytes + b'\r\n')
-            
-            # Small delay to avoid overwhelming the client
-            import time
-            time.sleep(0.03)  # ~30 FPS
+                    try:
+                        frame_to_send = current_frame.copy()
+                        if frame_to_send.shape[0] > 720:
+                            scale = 720 / frame_to_send.shape[0]
+                            frame_to_send = cv2.resize(frame_to_send, None, fx=scale, fy=scale)
+                        
+                        ret, buffer = cv2.imencode('.jpg', frame_to_send, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                        if ret:
+                            frame_bytes = buffer.tobytes()
+                            yield (b'--frame\r\n'
+                                   b'Content-Type: image/jpeg\r\n'
+                                   b'Content-Length: ' + str(len(frame_bytes)).encode() + b'\r\n\r\n'
+                                   + frame_bytes + b'\r\n')
+                    except Exception as e:
+                        logger.error(f"Frame encoding error: {e}")
+            time.sleep(0.05)
     
-    return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    response = Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response
 
 
 @app.route("/api/alerts")
 def get_alerts():
     """Get all alerts."""
     alerts = load_alert_history()
-    # Convert paths to API image endpoint
     for alert in alerts:
         if "snapshot_path" in alert:
-            # Extract filename from path
             filename = alert["snapshot_path"].replace("\\", "/").split("/")[-1]
-            # Update to use API image serving endpoint
             alert["snapshot_path"] = f"/api/image/{filename}"
-    # Return all alerts (sorted by newest first)
     return jsonify(list(reversed(alerts)) if alerts else [])
 
 
@@ -372,7 +361,6 @@ def start_detection():
         is_running = True
         current_detections = []
         
-        # Start detection with WeaponDetectionRunner
         detection_thread = threading.Thread(target=run_detection_with_runner, args=(source,), daemon=True)
         detection_thread.start()
         
@@ -406,11 +394,9 @@ def set_config():
     """Update configuration."""
     data = request.json
     
-    # Validate and update config
     with config_lock:
         for key, value in data.items():
             if key in current_config:
-                # Type validation
                 if key == "alert_classes" and not isinstance(value, list):
                     return jsonify({"error": f"Invalid type for {key}"}), 400
                 if key in ["confidence_threshold", "imgsz"] and not isinstance(value, (int, float)):
@@ -444,6 +430,9 @@ def clear_alerts():
 if __name__ == "__main__":
     try:
         logger.info("Starting Flask server on http://0.0.0.0:5000")
-        app.run(debug=True, host="0.0.0.0", port=5000, threaded=True)
+        logger.info("Open browser: http://localhost:5000")
+        app.run(debug=False, host="0.0.0.0", port=5000, threaded=True, use_reloader=False)
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
     finally:
         is_running = False
